@@ -83,7 +83,7 @@ set(DUCKDB_PLATFORM "wasm_mvp")
 
 if(EMSCRIPTEN)
   # Bump stack size from default 64KB to 1MB
-  set(WASM_LINK_FLAGS "${WASM_LINK_FLAGS} -sSTACK_SIZE=1048576")
+  set(WASM_LINK_FLAGS "${WASM_LINK_FLAGS} -sSTACK_SIZE=1048576 -sWASM_BIGINT=0")
   # Release build
   if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNDEBUG")
@@ -296,7 +296,7 @@ if(EMSCRIPTEN)
       -s MAXIMUM_MEMORY=4GB \
       -s MODULARIZE=1 \
       -s EXPORT_NAME='DuckDB' \
-      -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"stackSave\", \"stackAlloc\", \"stackRestore\", \"createDyncallWrapper\", \"getTempRet0\", \"setTempRet0\"]' \
+      -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"stackSave\", \"stackAlloc\", \"stackRestore\", \"getTempRet0\", \"setTempRet0\"]' \
       --js-library=${CMAKE_SOURCE_DIR}/js-stubs.js")
 
 endif()

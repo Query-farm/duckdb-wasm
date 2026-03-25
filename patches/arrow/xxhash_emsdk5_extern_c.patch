@@ -1,0 +1,28 @@
+diff --git a/cpp/src/arrow/vendored/xxhash/xxhash.h b/cpp/src/arrow/vendored/xxhash/xxhash.h
+index a18e8c762..09bd98c87 100644
+--- a/cpp/src/arrow/vendored/xxhash/xxhash.h
++++ b/cpp/src/arrow/vendored/xxhash/xxhash.h
+@@ -3422,6 +3422,12 @@ XXH_PUBLIC_API XXH64_hash_t XXH64_hashFromCanonical(XXH_NOESCAPE const XXH64_can
+ #  endif
+ #endif
+ 
++/* Close extern "C" before SIMD includes - emsdk 5.x arm_neon.h pulls in
++ * emscripten.h which contains C++ templates incompatible with C linkage. */
++#if defined (__cplusplus)
++} /* extern "C" */
++#endif
++
+ #if defined(__GNUC__) || defined(__clang__)
+ #  if defined(__ARM_FEATURE_SVE)
+ #    include <arm_sve.h>
+@@ -3440,6 +3446,10 @@ XXH_PUBLIC_API XXH64_hash_t XXH64_hashFromCanonical(XXH_NOESCAPE const XXH64_can
+ #  endif
+ #endif
+ 
++#if defined (__cplusplus)
++extern "C" {
++#endif
++
+ #if defined(_MSC_VER)
+ #  include <intrin.h>
+ #endif
