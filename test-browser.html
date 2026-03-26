@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>DuckDB-WASM Shell</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    body { margin: 0; background: #1a1a0e; overflow: hidden; }
+    #header { padding: 10px 16px; color: #6ba034; font-family: "Inter", system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 600; border-bottom: 1px solid #3a3a28; }
+    #terminal { height: calc(100vh - 44px); padding: 8px 12px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="header">DuckDB-WASM (emsdk 5.0.4)</div>
+  <div id="terminal"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.min.js"></script>
+  <script type="module">
+    import { tableFromIPC } from 'https://cdn.jsdelivr.net/npm/apache-arrow@18.1.0/+esm';
+    import { Readline } from 'https://cdn.jsdelivr.net/npm/xterm-readline@1.1.2/+esm';
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: '"SF Mono", SFMono-Regular, Menlo, Monaco, monospace',
+      theme: { background: '#1a1a0e', foreground: '#f5f0e0', cursor: '#6ba034', selectionBackground: '#3a3a28' }
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    const rl = new Readline();
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+    term.loadAddon(rl);
+    term.open(document.getElementById('terminal'));
+    try { term.loadAddon(new WebglAddon.WebglAddon()); } catch (e) { /* canvas fallback */ }
+
+    // Batch writes within the same microtask to prevent flicker.
+    // xterm-readline clears + redraws the line in separate write() calls;
+    // this combines them into a single write so they render in one frame.
+    const _origWrite = term.write.bind(term);
+    let _writeBuf = '';
+    let _flushScheduled = false;
+    term.write = function(data) {
+      _writeBuf += data;
+      if (!_flushScheduled) {
+        _flushScheduled = true;
+        queueMicrotask(() => {
+          _origWrite(_writeBuf);
+          _writeBuf = '';
+          _flushScheduled = false;
+        });
+      }
+    };
+
+    fitAddon.fit();
+    window.addEventListener('resize', () => fitAddon.fit());
+
+    const PROMPT = '\x1b[32mD\x1b[0m> ';
+
+    function writeln(text, color) {
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (color) {
+          rl.println(`\x1b[${color}m${line}\x1b[0m`);
+        } else {
+          rl.println(line);
+        }
+      }
+    }
+
+    // Format Arrow table as text
+    function formatTable(table) {
+      const cols = table.schema.fields.map(f => f.name);
+      const rows = [];
+      for (let i = 0; i < table.numRows; i++) {
+        const row = {};
+        for (const col of cols) {
+          const val = table.getChild(col).get(i);
+          row[col] = val === null ? 'NULL' : String(val);
+        }
+        rows.push(row);
+      }
+      if (rows.length === 0) return '(0 rows)';
+      const widths = cols.map(c => Math.max(c.length, ...rows.map(r => r[c].length)));
+      const header = cols.map((c, i) => c.padEnd(widths[i])).join(' | ');
+      const sep = widths.map(w => '-'.repeat(w)).join('-+-');
+      const body = rows.map(row => cols.map((c, i) => row[c].padEnd(widths[i])).join(' | '));
+      return [header, sep, ...body, `(${rows.length} row${rows.length !== 1 ? 's' : ''})`].join('\n');
+    }
+
+    //===--------------------------------------------------------------------===//
+    // OAuth PKCE support via SharedArrayBuffer
+    //===--------------------------------------------------------------------===//
+
+    const oauthSAB = typeof SharedArrayBuffer !== 'undefined' ? new SharedArrayBuffer(8192) : null;
+    let oauthPopup = null;
+
+    function handleOAuthCallback(data) {
+      if (!oauthSAB) return;
+      const int32 = new Int32Array(oauthSAB);
+      const bytes = new Uint8Array(oauthSAB);
+      if (data.error) {
+        const errMsg = data.errorDesc || data.error;
+        const encoded = new TextEncoder().encode(errMsg);
+        new DataView(oauthSAB).setInt32(4, encoded.length, true);
+        bytes.set(encoded, 8);
+        Atomics.store(int32, 0, -1);
+      } else {
+        const encoded = new TextEncoder().encode(data.code);
+        new DataView(oauthSAB).setInt32(4, encoded.length, true);
+        bytes.set(encoded, 8);
+        Atomics.store(int32, 0, 1);
+      }
+      Atomics.notify(int32, 0);
+      oauthPopup = null;
+    }
+
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'oauth-callback') handleOAuthCallback(e.data);
+    });
+
+    if (typeof BroadcastChannel !== 'undefined') {
+      const oauthBC = new BroadcastChannel('duckdb-wasm-oauth');
+      oauthBC.onmessage = (e) => {
+        if (e.data && e.data.type === 'oauth-callback') handleOAuthCallback(e.data);
+      };
+    }
+
+    //===--------------------------------------------------------------------===//
+    // Worker communication
+    //===--------------------------------------------------------------------===//
+
+    const worker = new Worker('./test-worker.js?v=' + Date.now());
+    let pendingResolve = null;
+
+    if (oauthSAB) {
+      worker.postMessage({ type: 'init-oauth-sab', sab: oauthSAB });
+    }
+
+    worker.onmessage = function(e) {
+      const d = e.data;
+      if (d.type === 'open-auth-url') {
+        const int32 = new Int32Array(oauthSAB);
+        Atomics.store(int32, 0, 0);
+        oauthPopup = window.open(d.url, '_blank', 'popup,width=500,height=700');
+        if (!oauthPopup) {
+          const errMsg = 'Popup blocked — please allow popups for this site and retry';
+          const encoded = new TextEncoder().encode(errMsg);
+          const bytes = new Uint8Array(oauthSAB);
+          new DataView(oauthSAB).setInt32(4, encoded.length, true);
+          bytes.set(encoded, 8);
+          Atomics.store(int32, 0, -1);
+          Atomics.notify(int32, 0);
+        }
+        return;
+      }
+      if (d.type === 'log') {
+        const colorMap = { ok: '32', err: '31', info: '33' };
+        writeln(d.msg, colorMap[d.cls]);
+      } else if (d.type === 'ready') {
+        writeln('');
+        writeln('Type SQL queries below. Press Enter to execute.', '33');
+        writeln('');
+        readLoop();
+      } else if (d.type === 'result') {
+        if (d.ok) {
+          if (d.arrowBuffers) {
+            try {
+              let allRows = [];
+              let cols = null;
+              for (const buf of d.arrowBuffers) {
+                const table = tableFromIPC(new Uint8Array(buf));
+                if (!cols) cols = table.schema.fields.map(f => f.name);
+                for (let i = 0; i < table.numRows; i++) {
+                  const row = {};
+                  for (const c of cols) {
+                    const val = table.getChild(c).get(i);
+                    row[c] = val === null ? 'NULL' : String(val);
+                  }
+                  allRows.push(row);
+                }
+              }
+              if (cols && allRows.length > 0) {
+                const widths = cols.map(c => Math.max(c.length, ...allRows.map(r => r[c].length)));
+                const header = cols.map((c, i) => c.padEnd(widths[i])).join(' | ');
+                const sep = widths.map(w => '-'.repeat(w)).join('-+-');
+                const body = allRows.map(row => cols.map((c, i) => row[c].padEnd(widths[i])).join(' | '));
+                writeln([header, sep, ...body, `(${allRows.length} row${allRows.length !== 1 ? 's' : ''})`].join('\n'));
+              } else {
+                writeln('(0 rows)');
+              }
+            } catch (err) {
+              writeln('OK (could not decode: ' + err.message + ')', '33');
+            }
+          } else {
+            writeln('OK', '32');
+          }
+        } else {
+          writeln('Error: ' + d.error, '31');
+        }
+        if (pendingResolve) {
+          pendingResolve();
+          pendingResolve = null;
+        }
+      } else if (d.type === 'completions') {
+        if (completionResolve) {
+          let completions = [];
+          if (d.arrowBuffers) {
+            try {
+              for (const buf of d.arrowBuffers) {
+                const table = tableFromIPC(new Uint8Array(buf));
+                const sugCol = table.getChild('suggestion');
+                const startCol = table.getChild('suggestion_start');
+                const scoreCol = table.getChild('suggestion_score');
+                const extraCol = table.getChild('extra_char');
+                for (let i = 0; i < table.numRows; i++) {
+                  completions.push({
+                    suggestion: sugCol ? String(sugCol.get(i)) : '',
+                    start: startCol ? Number(startCol.get(i)) : 0,
+                    score: scoreCol ? Number(scoreCol.get(i)) : 0,
+                    extra: extraCol ? String(extraCol.get(i) || '') : ''
+                  });
+                }
+              }
+            } catch (e) {}
+          }
+          completionResolve(completions);
+          completionResolve = null;
+        }
+      }
+    };
+
+    //===--------------------------------------------------------------------===//
+    // Tab completion via sql_auto_complete
+    // Score-based auto-accept for unique winners; interactive arrow-key
+    // navigation with highlighting for ties (like zsh/linenoise).
+    //===--------------------------------------------------------------------===//
+
+    let completionResolve = null;
+    // Row-major layout: items fill left→right, top→bottom.
+    // Arrow keys navigate the visual grid.
+    const comp = {
+      active: false, items: [], idx: 0, start: 0, original: '',
+      menuLines: 0, numCols: 1, numRows: 1, colWidth: 10
+    };
+
+    function computeLayout() {
+      const maxLen = Math.max(...comp.items.map(c => c.suggestion.length));
+      comp.colWidth = maxLen + 2;
+      comp.numCols = Math.max(1, Math.floor(term.cols / comp.colWidth));
+      comp.numRows = Math.ceil(comp.items.length / comp.numCols);
+    }
+
+    function clearCompletionMenu() {
+      if (comp.menuLines > 0) {
+        for (let i = 0; i < comp.menuLines; i++) {
+          term.write('\r\n\x1b[2K');
+        }
+        term.write(`\x1b[${comp.menuLines}A`);
+        comp.menuLines = 0;
+      }
+    }
+
+    function renderCompletionMenu() {
+      clearCompletionMenu();
+      const lines = [];
+      for (let row = 0; row < comp.numRows; row++) {
+        let line = '';
+        for (let col = 0; col < comp.numCols; col++) {
+          const i = row * comp.numCols + col; // row-major
+          if (i >= comp.items.length) continue;
+          const text = comp.items[i].suggestion.padEnd(comp.colWidth);
+          if (i === comp.idx) {
+            line += `\x1b[7m${text}\x1b[0m`;
+          } else {
+            line += text;
+          }
+        }
+        lines.push(line);
+      }
+      for (const line of lines) {
+        term.write('\r\n\x1b[2K' + line);
+      }
+      if (lines.length > 0) {
+        term.write(`\x1b[${lines.length}A\r`);
+      }
+      comp.menuLines = lines.length;
+      rl.state.refresh();
+    }
+
+    function applyCompletion(idx) {
+      const state = rl.state;
+      if (!state) return;
+      const c = comp.items[idx];
+      const before = comp.original.slice(0, comp.start);
+      state.update(before + c.suggestion);
+    }
+
+    function exitCompletionMode(accept) {
+      if (!comp.active) return;
+      comp.active = false;
+      if (!accept) {
+        rl.state.update(comp.original);
+      }
+      clearCompletionMenu();
+      rl.state.refresh();
+    }
+
+    function enterCompletionMode(items, start, original) {
+      comp.active = true;
+      comp.items = items;
+      comp.idx = 0;
+      comp.start = start;
+      comp.original = original;
+      comp.menuLines = 0;
+      computeLayout();
+      applyCompletion(0);
+      renderCompletionMenu();
+    }
+
+    function moveCompletion(newIdx) {
+      if (newIdx < 0 || newIdx >= comp.items.length) return;
+      comp.idx = newIdx;
+      applyCompletion(comp.idx);
+      renderCompletionMenu();
+    }
+
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type !== 'keydown') {
+        if (comp.active && ['Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Escape', 'Enter'].includes(event.key)) {
+          return false;
+        }
+        return true;
+      }
+
+      if (comp.active) {
+        // Row-major: Right/Tab = next item, Left/Shift-Tab = prev item
+        //            Down = same column next row, Up = same column prev row
+        if (event.key === 'ArrowRight' || (event.key === 'Tab' && !event.shiftKey)) {
+          event.preventDefault();
+          moveCompletion((comp.idx + 1) % comp.items.length);
+          return false;
+        }
+        if (event.key === 'ArrowLeft' || (event.key === 'Tab' && event.shiftKey)) {
+          event.preventDefault();
+          moveCompletion((comp.idx - 1 + comp.items.length) % comp.items.length);
+          return false;
+        }
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          const next = comp.idx + comp.numCols;
+          moveCompletion(next < comp.items.length ? next : comp.idx);
+          return false;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          const prev = comp.idx - comp.numCols;
+          moveCompletion(prev >= 0 ? prev : comp.idx);
+          return false;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          exitCompletionMode(true);
+          return false;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          exitCompletionMode(false);
+          return false;
+        }
+        // Any other key: accept current completion and let the key through
+        exitCompletionMode(true);
+        return true;
+      }
+
+      // Not in completion mode — Tab triggers completion
+      if (event.key === 'Tab' && !event.shiftKey) {
+        event.preventDefault();
+        const state = rl.state;
+        if (state) {
+          const buf = state.buffer();
+          if (buf.trim()) {
+            worker.postMessage({ type: 'complete', text: buf });
+            new Promise(resolve => { completionResolve = resolve; }).then(completions => {
+              if (!completions || completions.length === 0) return;
+              const currentBuf = state.buffer();
+              const hasTies = completions.length > 1 &&
+                completions[0].score === completions[1].score;
+
+              if (!hasTies) {
+                // Unique best score — auto-accept
+                const c = completions[0];
+                const typed = currentBuf.slice(c.start);
+                const toInsert = c.suggestion.slice(typed.length);
+                if (toInsert) state.editInsert(toInsert);
+              } else {
+                // Ties — insert common prefix first
+                const start = completions[0].start;
+                const typed = currentBuf.slice(start);
+                let common = completions[0].suggestion;
+                for (let i = 1; i < completions.length; i++) {
+                  let j = 0;
+                  while (j < common.length && j < completions[i].suggestion.length &&
+                         common[j].toLowerCase() === completions[i].suggestion[j].toLowerCase()) j++;
+                  common = common.slice(0, j);
+                }
+                const toInsert = common.slice(typed.length);
+                if (toInsert) {
+                  state.editInsert(toInsert);
+                } else {
+                  // No more common prefix — enter interactive navigation
+                  enterCompletionMode(completions, start, currentBuf);
+                }
+              }
+            });
+          }
+        }
+        return false;
+      }
+      return true;
+    });
+
+    //===--------------------------------------------------------------------===//
+    // Read loop with xterm-readline
+    //===--------------------------------------------------------------------===//
+
+    async function readLoop() {
+      while (true) {
+        const sql = await rl.read(PROMPT);
+        if (!sql.trim()) continue;
+        rl.appendHistory(sql.trim());
+        worker.postMessage({ type: 'query', sql: sql.trim() });
+        await new Promise(resolve => { pendingResolve = resolve; });
+      }
+    }
+  </script>
+</body>
+</html>

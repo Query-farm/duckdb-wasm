@@ -15,7 +15,7 @@ endif()
 set(DUCKDB_CXX_FLAGS "${DUCKDB_CXX_FLAGS} -Wno-unqualified-std-cast-call -DDUCKDB_DEBUG_NO_SAFETY -DDUCKDB_FROM_DUCKDB_WASM")
 message("DUCKDB_CXX_FLAGS=${DUCKDB_CXX_FLAGS}")
 
-set(DUCKDB_EXTENSIONS "json;core_functions")
+set(DUCKDB_EXTENSIONS "json;core_functions;autocomplete")
 # Escape semicolons in DUCKDB_EXTENSIONS before passing to ExternalProject_Add
 string(REPLACE ";" "$<SEMICOLON>" DUCKDB_EXTENSIONS_PACKED "${DUCKDB_EXTENSIONS}")
 
