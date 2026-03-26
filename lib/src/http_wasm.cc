@@ -27,6 +27,44 @@ HTTPHeaders TransformHeadersWasm(const HTTPHeaders &header_map, const HTTPParams
     return res_headers;
 }
 
+// Parse the response buffer returned from EM_ASM_PTR.
+// Layout: [status:2bytes LE][headersLen:4bytes LE][headers][bodyLen:4bytes LE][body]
+static unique_ptr<HTTPResponse> ParseWasmResponse(char *exe) {
+    if (!exe) {
+        auto res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
+        res->reason = "XMLHttpRequest failed or unavailable — check the browser console for CORS or network errors";
+        return res;
+    }
+    auto p = reinterpret_cast<uint8_t *>(exe);
+    uint16_t status_code = p[0] | (p[1] << 8);
+    p += 2;
+    uint32_t headers_len = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    p += 4;
+    string raw_headers(reinterpret_cast<char *>(p), headers_len);
+    p += headers_len;
+    uint32_t body_len = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    p += 4;
+
+    auto res = make_uniq<HTTPResponse>(HTTPUtil::ToStatusCode(status_code));
+    if (body_len > 0) {
+        res->body = string(reinterpret_cast<char *>(p), body_len);
+    }
+    for (auto &line : StringUtil::Split(raw_headers, "\r\n")) {
+        auto colon = line.find(':');
+        if (colon != string::npos) {
+            auto key = line.substr(0, colon);
+            auto val = line.substr(colon + 1);
+            StringUtil::Trim(key);
+            StringUtil::Trim(val);
+            if (!key.empty()) {
+                res->headers.Insert(key, val);
+            }
+        }
+    }
+    free(exe);
+    return res;
+}
+
 class HTTPWasmClient : public HTTPClient {
    public:
     HTTPWasmClient(HTTPFSParams &http_params, const string &proto_host_port) { host_port = proto_host_port; }
@@ -113,32 +151,36 @@ class HTTPWasmClient : public HTTPClient {
                 } catch {
                     return 0;
                 }
-                if (xhr.status >= 400) return 0;
                 var uInt8Array = xhr.response;
-
-                var len = uInt8Array.byteLength;
-                var fileOnWasmHeap = _malloc(len + 4);
-
-                var properArray = new Uint8Array(uInt8Array);
-
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + fileOnWasmHeap + 4] = properArray[iii];
+                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
+                var status = xhr.status;
+                if (status === 0) return 0;
+                var hdrs = xhr.getAllResponseHeaders() || "";
+                var hdrsBytes = new TextEncoder().encode(hdrs);
+                var hdrsLen = hdrsBytes.length;
+                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+                var buf = _malloc(total);
+                if (buf === 0) return 0;
+                var off = buf;
+                Module.HEAPU8[off] = status & 0xFF;
+                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
+                off += 2;
+                Module.HEAPU8[off] = hdrsLen & 0xFF;
+                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
+                off += 4;
+                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
+                off += hdrsLen;
+                Module.HEAPU8[off] = bodyLen & 0xFF;
+                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
+                off += 4;
+                if (bodyLen > 0) {
+                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
                 }
-                var LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap);
-                return fileOnWasmHeap;
+                return buf;
             },
             path.c_str(), n, z, "GET");
         // clang-format on
@@ -152,28 +194,9 @@ class HTTPWasmClient : public HTTPClient {
         }
         free(z);
 
-        if (!exe) {
-            res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
-            res->reason = "Please consult the browser console for details, might be potentially a CORS error";
-        } else {
-            res = duckdb::make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
-            uint64_t LEN = 0;
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0];
-            res->body = string(exe + 4, LEN);
-
-            idx_t LEN_X_T = LEN;
-            if (info.content_handler) {
-                info.content_handler(((const unsigned char *)exe) + 4, LEN_X_T);
-            }
-
-            free(exe);
+        res = ParseWasmResponse(exe);
+        if (res->status == HTTPStatusCode::OK_200 && info.content_handler && !res->body.empty()) {
+            info.content_handler(reinterpret_cast<const unsigned char *>(res->body.data()), res->body.size());
         }
 
         return res;
@@ -259,72 +282,36 @@ console.log('HEAD', UTF8ToString(ptr1), UTF8ToString(ptr2));
                 } catch {
                     return 0;
                 }
-                if (xhr.status >= 400) return 0;
-
                 var uInt8Array = xhr.response;
-                var len = uInt8Array.byteLength;
-                var fileOnWasmHeap = _malloc(len + 8);
-
-                var properArray = new Uint8Array(uInt8Array);
-
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + fileOnWasmHeap + 8] = properArray[iii];
+                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
+                var status = xhr.status;
+                if (status === 0) return 0;
+                var hdrs = xhr.getAllResponseHeaders() || "";
+                var hdrsBytes = new TextEncoder().encode(hdrs);
+                var hdrsLen = hdrsBytes.length;
+                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+                var buf = _malloc(total);
+                if (buf === 0) return 0;
+                var off = buf;
+                Module.HEAPU8[off] = status & 0xFF;
+                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
+                off += 2;
+                Module.HEAPU8[off] = hdrsLen & 0xFF;
+                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
+                off += 4;
+                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
+                off += hdrsLen;
+                Module.HEAPU8[off] = bodyLen & 0xFF;
+                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
+                off += 4;
+                if (bodyLen > 0) {
+                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
                 }
-
-                var LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap + 4);
-
-		var headers = Uint8Array.from(Array.from(xhr.getAllResponseHeaders()).map(letter => letter.charCodeAt(0)));
-		len = headers.byteLength;
-                var headersOnWasmHeap = _malloc(len + 8);
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + headersOnWasmHeap + 8] = headers[iii];
-                }
-
-                LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, headersOnWasmHeap + 4);
-
-		len = headersOnWasmHeap;
-                LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap);
-
-                return fileOnWasmHeap;
+                return buf;
             },
             path.c_str(), n, z, "HEAD");
 
@@ -338,88 +325,7 @@ console.log('HEAD', UTF8ToString(ptr1), UTF8ToString(ptr2));
         }
         free(z);
 
-        if (!exe) {
-            res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
-            res->reason = "Please consult the browser console for details, might be potentially a CORS error";
-        } else {
-            res = duckdb::make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
-
-		uint64_t next = 0;
-	{
-            uint64_t LEN = 0;	
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0];
-		next = LEN;
-	}
-		uint64_t len = 0;
-	{
-            uint64_t LEN = 0;	
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0 + 4];
-		len = LEN;
-	}
-
-		uint64_t len_headers = 0;
-	{
-            uint64_t LEN = 0;	
-            LEN *= 256;
-            LEN += ((uint8_t *)next)[3 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)next)[2 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)next)[1 + 4];
-            LEN *= 256;
-            LEN += ((uint8_t *)next)[0 + 4];
-		len_headers = LEN;
-	}
-		
-	char * ptr = reinterpret_cast<char*>(next) ;
-
-
-	string headers = string(ptr + 8, len_headers);
-
-vector<string> vec_headers = StringUtil::Split(headers, "\r\n");
-
-for (auto h : vec_headers) {
-int i = 0;
-while (i < h.size() && h[i] != ':') i++;
-
-string head = string(h.c_str(), i);
-
-while (i < h.size() && h[i] != ' ') i++;
-string tail = string(h.c_str() + i+1);
-
-res->headers.Insert(head, tail);	
-	}
-	
-
-
-
-
-            res->body = string(exe + 8, len);
-            /*
-                        if (info.content_handler) {
-                            info.content_handler((const unsigned char *)exe + 4, LEN);
-                        }
-            */
-
-            free(exe);
-            free(ptr);
-        }
-        // clang-format on
-
+        res = ParseWasmResponse(exe);
         return res;
     }
     unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
@@ -513,32 +419,36 @@ res->headers.Insert(head, tail);
                 } catch {
                     return 0;
                 }
-                if (xhr.status >= 400) return 0;
                 var uInt8Array = xhr.response;
-
-                var len = uInt8Array.byteLength;
-                var fileOnWasmHeap = _malloc(len + 4);
-
-                var properArray = new Uint8Array(uInt8Array);
-
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + fileOnWasmHeap + 4] = properArray[iii];
+                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
+                var status = xhr.status;
+                if (status === 0) return 0;
+                var hdrs = xhr.getAllResponseHeaders() || "";
+                var hdrsBytes = new TextEncoder().encode(hdrs);
+                var hdrsLen = hdrsBytes.length;
+                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+                var buf = _malloc(total);
+                if (buf === 0) return 0;
+                var off = buf;
+                Module.HEAPU8[off] = status & 0xFF;
+                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
+                off += 2;
+                Module.HEAPU8[off] = hdrsLen & 0xFF;
+                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
+                off += 4;
+                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
+                off += hdrsLen;
+                Module.HEAPU8[off] = bodyLen & 0xFF;
+                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
+                off += 4;
+                if (bodyLen > 0) {
+                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
                 }
-                var LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap);
-                return fileOnWasmHeap;
+                return buf;
             },
             path.c_str(), n, z, "POST", payload, buffer_length);
         // clang-format on
@@ -554,27 +464,10 @@ res->headers.Insert(head, tail);
         }
         free(z);
 
-        if (!exe) {
-            res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
-            res->reason = "Please consult the browser console for details, might be potentially a CORS error";
-        } else {
-            res = duckdb::make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
-            uint64_t LEN = 0;
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0];
-            res->body = string(exe + 4, LEN);
-
-            info.buffer_out += string(exe + 4, LEN);
-
-            free(exe);
+        res = ParseWasmResponse(exe);
+        if (!res->body.empty()) {
+            info.buffer_out += res->body;
         }
-
         return res;
     }
     unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
@@ -669,32 +562,36 @@ res->headers.Insert(head, tail);
                 } catch {
                     return 0;
                 }
-                if (xhr.status >= 400) return 0;
-		var uInt8Array = Uint8Array.from(Array.from(xhr.getResponseHeader("Etag")).map(letter => letter.charCodeAt(0)));
-
-                var len = uInt8Array.byteLength;
-                var fileOnWasmHeap = _malloc(len + 4);
-
-                var properArray = new Uint8Array(uInt8Array);
-
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + fileOnWasmHeap + 4] = properArray[iii];
+                var uInt8Array = xhr.response;
+                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
+                var status = xhr.status;
+                if (status === 0) return 0;
+                var hdrs = xhr.getAllResponseHeaders() || "";
+                var hdrsBytes = new TextEncoder().encode(hdrs);
+                var hdrsLen = hdrsBytes.length;
+                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+                var buf = _malloc(total);
+                if (buf === 0) return 0;
+                var off = buf;
+                Module.HEAPU8[off] = status & 0xFF;
+                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
+                off += 2;
+                Module.HEAPU8[off] = hdrsLen & 0xFF;
+                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
+                off += 4;
+                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
+                off += hdrsLen;
+                Module.HEAPU8[off] = bodyLen & 0xFF;
+                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
+                off += 4;
+                if (bodyLen > 0) {
+                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
                 }
-                var LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap);
-                return fileOnWasmHeap;
+                return buf;
             },
             path.c_str(), n, z, "PUT", payload, buffer_length);
         // clang-format on
@@ -710,27 +607,7 @@ res->headers.Insert(head, tail);
         }
         free(z);
 
-        if (!exe) {
-            res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
-            res->reason = "Please consult the browser console for details, might be potentially a CORS error";
-        } else {
-            res = duckdb::make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
-            uint64_t LEN = 0;
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0];
-            res->headers.Insert("ETag", string(exe + 4, LEN));
-
-            // info.buffer_out += string(exe + 4, LEN);
-
-            free(exe);
-        }
-
+        res = ParseWasmResponse(exe);
         return res;
     }
     unique_ptr<HTTPResponse> Delete(DeleteRequestInfo &info) override {
@@ -814,32 +691,36 @@ res->headers.Insert(head, tail);
                 } catch {
                     return 0;
                 }
-                if (xhr.status >= 400) return 0;
                 var uInt8Array = xhr.response;
-
-                var len = uInt8Array.byteLength;
-                var fileOnWasmHeap = _malloc(len + 4);
-
-                var properArray = new Uint8Array(uInt8Array);
-
-                for (var iii = 0; iii < len; iii++) {
-                    Module.HEAPU8[iii + fileOnWasmHeap + 4] = properArray[iii];
+                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
+                var status = xhr.status;
+                if (status === 0) return 0;
+                var hdrs = xhr.getAllResponseHeaders() || "";
+                var hdrsBytes = new TextEncoder().encode(hdrs);
+                var hdrsLen = hdrsBytes.length;
+                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+                var buf = _malloc(total);
+                if (buf === 0) return 0;
+                var off = buf;
+                Module.HEAPU8[off] = status & 0xFF;
+                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
+                off += 2;
+                Module.HEAPU8[off] = hdrsLen & 0xFF;
+                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
+                off += 4;
+                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
+                off += hdrsLen;
+                Module.HEAPU8[off] = bodyLen & 0xFF;
+                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
+                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
+                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
+                off += 4;
+                if (bodyLen > 0) {
+                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
                 }
-                var LEN123 = new Uint8Array(4);
-                LEN123[0] = len % 256;
-                len -= LEN123[0];
-                len /= 256;
-                LEN123[1] = len % 256;
-                len -= LEN123[1];
-                len /= 256;
-                LEN123[2] = len % 256;
-                len -= LEN123[2];
-                len /= 256;
-                LEN123[3] = len % 256;
-                len -= LEN123[3];
-                len /= 256;
-                Module.HEAPU8.set(LEN123, fileOnWasmHeap);
-                return fileOnWasmHeap;
+                return buf;
             },
             path.c_str(), n, z, "DELETE");
         // clang-format on
@@ -853,30 +734,7 @@ res->headers.Insert(head, tail);
         }
         free(z);
 
-        if (!exe) {
-            res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
-            res->reason = "Please consult the browser console for details, might be potentially a CORS error";
-        } else {
-            res = duckdb::make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
-            uint64_t LEN = 0;
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[3];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[2];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[1];
-            LEN *= 256;
-            LEN += ((uint8_t *)exe)[0];
-            res->body = string(exe + 4, LEN);
-            /*
-                        if (info.content_handler) {
-                            info.content_handler((const unsigned char *)exe + 4, LEN);
-                        }
-            */
-
-            free(exe);
-        }
-
+        res = ParseWasmResponse(exe);
         return res;
     }
 
@@ -892,3 +750,4 @@ unique_ptr<HTTPClient> HTTPWasmUtil::InitializeClient(HTTPParams &http_params, c
 string HTTPWasmUtil::GetName() const { return "WasmHTTPUtils"; }
 
 }  // namespace duckdb
+
