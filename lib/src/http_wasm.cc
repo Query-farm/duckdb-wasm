@@ -2,8 +2,6 @@
 
 #include <emscripten.h>
 
-#include <iostream>
-
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/web/config.h"
 
@@ -12,30 +10,22 @@ class HTTPLogger;
 class FileOpener;
 struct FileOpenerInfo;
 class HTTPState;
-HTTPHeaders TransformHeadersWasm(const HTTPHeaders &header_map, const HTTPParams &params) {
-    auto &httpfs_params = params.Cast<HTTPFSParams>();
 
-    HTTPHeaders res_headers;
-    for (auto &header : header_map) {
-        res_headers.Insert(header.first, header.second);
-    }
-    if (!httpfs_params.pre_merged_headers) {
-        for (auto &entry : params.extra_headers) {
-            res_headers.Insert(entry.first, entry.second);
-        }
-    }
-    return res_headers;
-}
+//===--------------------------------------------------------------------===//
+// Response parsing
+//===--------------------------------------------------------------------===//
 
-// Parse the response buffer returned from EM_ASM_PTR.
-// Layout: [status:2bytes LE][headersLen:4bytes LE][headers][bodyLen:4bytes LE][body]
-static unique_ptr<HTTPResponse> ParseWasmResponse(char *exe) {
-    if (!exe) {
+// Parse the binary response buffer returned from XHR JS functions.
+// Layout: [status:2 LE][headersLen:4 LE][headers (UTF-8)][bodyLen:4 LE][body]
+// Takes ownership of `buf` (frees it).
+// If `buf` is null (XHR unavailable, CORS block, OOM, or send exception), returns 404 with a diagnostic.
+static unique_ptr<HTTPResponse> ParseWasmResponse(char *buf) {
+    if (!buf) {
         auto res = make_uniq<HTTPResponse>(HTTPStatusCode::NotFound_404);
         res->reason = "XMLHttpRequest failed or unavailable — check the browser console for CORS or network errors";
         return res;
     }
-    auto p = reinterpret_cast<uint8_t *>(exe);
+    auto p = reinterpret_cast<uint8_t *>(buf);
     uint16_t status_code = p[0] | (p[1] << 8);
     p += 2;
     uint32_t headers_len = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
@@ -61,681 +51,226 @@ static unique_ptr<HTTPResponse> ParseWasmResponse(char *exe) {
             }
         }
     }
-    free(exe);
+    free(buf);
     return res;
 }
 
+//===--------------------------------------------------------------------===//
+// URL normalization
+//===--------------------------------------------------------------------===//
+
+static string NormalizeUrl(const string &url, const string &host_port) {
+    string path = url;
+    if (!path.empty() && path[0] == '/') {
+        path = host_port + url;
+    }
+    if (!web::experimental_s3_tables_global_proxy.empty()) {
+        if (url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
+            auto id_table = path.find("--table-s3.s3.");
+            auto id_aws = path.find(".amazonaws.com/");
+            if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
+                path = web::experimental_s3_tables_global_proxy + path.substr(8);
+            }
+        }
+    }
+    if (path.rfind("https://", 0) != 0 && path.rfind("http://", 0) != 0) {
+        path = "https://" + path;
+    }
+    return path;
+}
+
+//===--------------------------------------------------------------------===//
+// Header marshalling (C++ → WASM heap for JS)
+//===--------------------------------------------------------------------===//
+
+struct WasmHeaderArray {
+    char **ptrs = nullptr;
+    int count = 0;
+
+    WasmHeaderArray(const HTTPHeaders &headers, const HTTPParams &params) {
+        auto &httpfs_params = params.Cast<HTTPFSParams>();
+        HTTPHeaders merged;
+        for (auto &h : headers) {
+            merged.Insert(h.first, h.second);
+        }
+        if (!httpfs_params.pre_merged_headers) {
+            for (auto &e : params.extra_headers) {
+                merged.Insert(e.first, e.second);
+            }
+        }
+        for (auto &h : merged) {
+            count++;
+        }
+        ptrs = static_cast<char **>(malloc(count * 2 * sizeof(char *)));
+        int i = 0;
+        for (auto &h : merged) {
+            ptrs[i] = static_cast<char *>(malloc(h.first.size() + 1));
+            memcpy(ptrs[i], h.first.c_str(), h.first.size() + 1);
+            i++;
+            ptrs[i] = static_cast<char *>(malloc(h.second.size() + 1));
+            memcpy(ptrs[i], h.second.c_str(), h.second.size() + 1);
+            i++;
+        }
+    }
+    ~WasmHeaderArray() {
+        for (int i = 0; i < count * 2; i++) {
+            free(ptrs[i]);
+        }
+        free(ptrs);
+    }
+    WasmHeaderArray(const WasmHeaderArray &) = delete;
+    WasmHeaderArray &operator=(const WasmHeaderArray &) = delete;
+};
+
+//===--------------------------------------------------------------------===//
+// EM_JS XHR functions — defined once, called by all HTTP methods.
+//
+// These are real C functions with JS bodies (via emscripten EM_JS).
+// Unlike EM_ASM, they use named parameters and can be shared across call sites.
+//
+// Response format: [status:2 LE][hdrsLen:4 LE][headers][bodyLen:4 LE][body]
+// Returns 0 on: XHR unavailable, send exception, CORS block (status 0), malloc OOM.
+//===--------------------------------------------------------------------===//
+
+// clang-format off
+
+// XHR for methods without a request body (GET, HEAD, DELETE).
+EM_JS(char*, wasm_xhr_no_body, (const char *url_ptr, int header_count, char **header_array, const char *method_ptr), {
+    var url = UTF8ToString(url_ptr);
+    if (typeof XMLHttpRequest === 'undefined') return 0;
+    var xhr = new XMLHttpRequest();
+    xhr.open(UTF8ToString(method_ptr), url, false);
+    xhr.responseType = 'arraybuffer';
+    var i = 0;
+    while (i < header_count * 2) {
+        var p1 = HEAP32[(header_array) / 4 + i];
+        var p2 = HEAP32[(header_array) / 4 + i + 1];
+        try {
+            var name = UTF8ToString(p1);
+            if (name === 'Host') name = 'X-Host-Override';
+            if (name === 'User-Agent') name = 'X-user-agent';
+            xhr.setRequestHeader(name, UTF8ToString(p2));
+        } catch (e) { console.warn('XHR setRequestHeader failed:', e); }
+        i += 2;
+    }
+    try { xhr.send(null); } catch (e) { console.error('XHR send failed:', e); return 0; }
+    var resp = xhr.response;
+    var bodyLen = resp ? resp.byteLength : 0;
+    var status = xhr.status;
+    if (status === 0) return 0;
+    var hdrs = xhr.getAllResponseHeaders() || '';
+    var hdrsBuf = new TextEncoder().encode(hdrs);
+    var hdrsLen = hdrsBuf.length;
+    var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+    var buf = _malloc(total);
+    if (buf === 0) return 0;
+    var o = buf;
+    Module.HEAPU8[o] = status & 0xFF; Module.HEAPU8[o + 1] = (status >> 8) & 0xFF; o += 2;
+    Module.HEAPU8[o] = hdrsLen & 0xFF; Module.HEAPU8[o + 1] = (hdrsLen >> 8) & 0xFF;
+    Module.HEAPU8[o + 2] = (hdrsLen >> 16) & 0xFF; Module.HEAPU8[o + 3] = (hdrsLen >> 24) & 0xFF; o += 4;
+    if (hdrsLen > 0) Module.HEAPU8.set(hdrsBuf, o); o += hdrsLen;
+    Module.HEAPU8[o] = bodyLen & 0xFF; Module.HEAPU8[o + 1] = (bodyLen >> 8) & 0xFF;
+    Module.HEAPU8[o + 2] = (bodyLen >> 16) & 0xFF; Module.HEAPU8[o + 3] = (bodyLen >> 24) & 0xFF; o += 4;
+    if (bodyLen > 0) Module.HEAPU8.set(new Uint8Array(resp), o);
+    return buf;
+});
+
+// XHR for methods with a request body (POST, PUT).
+EM_JS(char*, wasm_xhr_with_body, (const char *url_ptr, int header_count, char **header_array, const char *method_ptr, const char *payload_ptr, int payload_len), {
+    var url = UTF8ToString(url_ptr);
+    if (typeof XMLHttpRequest === 'undefined') return 0;
+    var xhr = new XMLHttpRequest();
+    xhr.open(UTF8ToString(method_ptr), url, false);
+    xhr.responseType = 'arraybuffer';
+    var i = 0;
+    while (i < header_count * 2) {
+        var p1 = HEAP32[(header_array) / 4 + i];
+        var p2 = HEAP32[(header_array) / 4 + i + 1];
+        try {
+            var name = UTF8ToString(p1);
+            if (name === 'Host') name = 'X-Host-Override';
+            if (name === 'User-Agent') name = 'X-user-agent';
+            xhr.setRequestHeader(name, UTF8ToString(p2));
+        } catch (e) { console.warn('XHR setRequestHeader failed:', e); }
+        i += 2;
+    }
+    try {
+        xhr.send(Module.HEAPU8.slice(payload_ptr, payload_ptr + payload_len));
+    } catch (e) { console.error('XHR send failed:', e); return 0; }
+    var resp = xhr.response;
+    var bodyLen = resp ? resp.byteLength : 0;
+    var status = xhr.status;
+    if (status === 0) return 0;
+    var hdrs = xhr.getAllResponseHeaders() || '';
+    var hdrsBuf = new TextEncoder().encode(hdrs);
+    var hdrsLen = hdrsBuf.length;
+    var total = 2 + 4 + hdrsLen + 4 + bodyLen;
+    var buf = _malloc(total);
+    if (buf === 0) return 0;
+    var o = buf;
+    Module.HEAPU8[o] = status & 0xFF; Module.HEAPU8[o + 1] = (status >> 8) & 0xFF; o += 2;
+    Module.HEAPU8[o] = hdrsLen & 0xFF; Module.HEAPU8[o + 1] = (hdrsLen >> 8) & 0xFF;
+    Module.HEAPU8[o + 2] = (hdrsLen >> 16) & 0xFF; Module.HEAPU8[o + 3] = (hdrsLen >> 24) & 0xFF; o += 4;
+    if (hdrsLen > 0) Module.HEAPU8.set(hdrsBuf, o); o += hdrsLen;
+    Module.HEAPU8[o] = bodyLen & 0xFF; Module.HEAPU8[o + 1] = (bodyLen >> 8) & 0xFF;
+    Module.HEAPU8[o + 2] = (bodyLen >> 16) & 0xFF; Module.HEAPU8[o + 3] = (bodyLen >> 24) & 0xFF; o += 4;
+    if (bodyLen > 0) Module.HEAPU8.set(new Uint8Array(resp), o);
+    return buf;
+});
+
+// clang-format on
+
+//===--------------------------------------------------------------------===//
+// HTTPWasmClient — thin wrappers that normalize URL, marshal headers,
+// dispatch to the shared EM_JS XHR functions, and parse the response.
+//===--------------------------------------------------------------------===//
+
 class HTTPWasmClient : public HTTPClient {
    public:
-    HTTPWasmClient(HTTPFSParams &http_params, const string &proto_host_port) { host_port = proto_host_port; }
+    HTTPWasmClient(HTTPFSParams &http_params, const string &proto_host_port) : host_port(proto_host_port) {}
     void Initialize(HTTPParams &params) override {}
     string host_port;
 
     unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
-        // clang-format off
-        unique_ptr<HTTPResponse> res;
-
-        string path = info.url;
-        if (path[0] == '/') path = host_port + info.url;
-
-        if (!web::experimental_s3_tables_global_proxy.empty()) {
-            if (info.url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
-                auto id_table = path.find("--table-s3.s3.");
-                auto id_aws = path.find(".amazonaws.com/");
-                if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
-                    path = web::experimental_s3_tables_global_proxy + path.substr(8);
-                }
-            }
-        }
-        if ((path.rfind("https://", 0) != 0) && (path.rfind("http://", 0) != 0)) {
-            path = "https://" + path;
-        }
-        auto headers = TransformHeadersWasm(info.headers, info.params);
-
-        int n = 0;
-        for (auto h : headers) {
-            n++;
-        }
-        char **z = (char **)(void *)malloc(n * 4 * 2);
-
-        int i = 0;
-        for (auto h : headers) {
-            z[i] = (char *)malloc(h.first.size() * 4 + 1);
-            memset(z[i], 0, h.first.size() * 4 + 1);
-            memcpy(z[i], h.first.c_str(), h.first.size());
-            i++;
-            z[i] = (char *)malloc(h.second.size() * 4 + 1);
-            memset(z[i], 0, h.second.size() * 4 + 1);
-            memcpy(z[i], h.second.c_str(), h.second.size());
-            i++;
-        }
-
-        char *exe = NULL;
-        exe = (char *)EM_ASM_PTR(
-            {
-                var url = (UTF8ToString($0));
-                if (typeof XMLHttpRequest === "undefined") {
-                    return 0;
-                }
-                const xhr = new XMLHttpRequest();
-		if (false && url.startsWith("http://")) {
-			url = "https://" + url.substr(7);
-		}
-                xhr.open(UTF8ToString($3), url, false);
-                xhr.responseType = "arraybuffer";
-
-                var i = 0;
-                var len = $1;
-                while (i < len*2) {
-                    var ptr1 = HEAP32[($2)/4 + i ];
-                    var ptr2 = HEAP32[($2)/4 + i + 1];
-
-                    try {
-			var z = encodeURI(UTF8ToString(ptr1));
-			if (z === "Host") z = "X-Host-Override";
-			if (z === "User-Agent") z = "X-user-agent";
-			if (z === "Authorization") {
-                        	xhr.setRequestHeader(z, UTF8ToString(ptr2));
-			} else {
-				
-                        	xhr.setRequestHeader(z, encodeURI(UTF8ToString(ptr2)));
-			}
-                    } catch (error) {
-                console.warn("Error while performing XMLHttpRequest.setRequestHeader()", error);
-                    }
-                    i += 2;
-                }
-
-                try {
-                    xhr.send(null);
-                } catch {
-                    return 0;
-                }
-                var uInt8Array = xhr.response;
-                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
-                var status = xhr.status;
-                if (status === 0) return 0;
-                var hdrs = xhr.getAllResponseHeaders() || "";
-                var hdrsBytes = new TextEncoder().encode(hdrs);
-                var hdrsLen = hdrsBytes.length;
-                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
-                var buf = _malloc(total);
-                if (buf === 0) return 0;
-                var off = buf;
-                Module.HEAPU8[off] = status & 0xFF;
-                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
-                off += 2;
-                Module.HEAPU8[off] = hdrsLen & 0xFF;
-                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
-                off += 4;
-                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
-                off += hdrsLen;
-                Module.HEAPU8[off] = bodyLen & 0xFF;
-                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
-                off += 4;
-                if (bodyLen > 0) {
-                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
-                }
-                return buf;
-            },
-            path.c_str(), n, z, "GET");
-        // clang-format on
-
-        i = 0;
-        for (auto h : headers) {
-            free(z[i]);
-            i++;
-            free(z[i]);
-            i++;
-        }
-        free(z);
-
-        res = ParseWasmResponse(exe);
+        auto path = NormalizeUrl(info.url, host_port);
+        WasmHeaderArray h(info.headers, info.params);
+        auto exe = wasm_xhr_no_body(path.c_str(), h.count, h.ptrs, "GET");
+        auto res = ParseWasmResponse(exe);
         if (res->status == HTTPStatusCode::OK_200 && info.content_handler && !res->body.empty()) {
             info.content_handler(reinterpret_cast<const unsigned char *>(res->body.data()), res->body.size());
         }
-
         return res;
     }
+
     unique_ptr<HTTPResponse> Head(HeadRequestInfo &info) override {
-        unique_ptr<HTTPResponse> res;
-
-        string path = info.url;
-        if (path[0] == '/') path = host_port + info.url;
-
-        if (!web::experimental_s3_tables_global_proxy.empty()) {
-            if (info.url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
-                auto id_table = path.find("--table-s3.s3.");
-                auto id_aws = path.find(".amazonaws.com/");
-                if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
-                    path = web::experimental_s3_tables_global_proxy + path.substr(8);
-                }
-            }
-        }
-        if ((path.rfind("https://", 0) != 0) && (path.rfind("http://", 0) != 0)) {
-            path = "https://" + path;
-        }
-        auto headers = TransformHeadersWasm(info.headers, info.params);
-        int n = 0;
-        for (auto h : headers) {
-            n++;
-        }
-
-        char **z = (char **)(void *)malloc(n * 4 * 2);
-
-        int i = 0;
-        for (auto h : headers) {
-            z[i] = (char *)malloc(h.first.size() * 4 + 1);
-            memset(z[i], 0, h.first.size() * 4 + 1);
-            memcpy(z[i], h.first.c_str(), h.first.size());
-            i++;
-            z[i] = (char *)malloc(h.second.size() * 4 + 1);
-            memset(z[i], 0, h.second.size() * 4 + 1);
-            memcpy(z[i], h.second.c_str(), h.second.size());
-            i++;
-        }
-
-        // clang-format off
-        char *exe = NULL;
-        exe = (char *)EM_ASM_PTR(
-            {
-                var url = (UTF8ToString($0));
-                if (typeof XMLHttpRequest === "undefined") {
-                    return 0;
-                }
-                const xhr = new XMLHttpRequest();
-		if (false && url.startsWith("http://")) {
-			url = "https://" + url.substr(7);
-		}
-                xhr.open(UTF8ToString($3), url, false);
-                xhr.responseType = "arraybuffer";
-
-                var i = 0;
-                var len = $1;
-                while (i < len*2) {
-                    var ptr1 = HEAP32[($2)/4 + i ];
-                    var ptr2 = HEAP32[($2)/4 + i + 1];
-
-console.log('HEAD', UTF8ToString(ptr1), UTF8ToString(ptr2));
-                    try {
-			var z = encodeURI(UTF8ToString(ptr1));
-			if (z === "Host") z = "X-Host-Override";
-			if (z === "User-Agent") z = "X-user-agent";
-			if (z === "Authorization") {
-                        	xhr.setRequestHeader(z, UTF8ToString(ptr2));
-			} else {
-				
-                        	xhr.setRequestHeader(z, encodeURI(UTF8ToString(ptr2)));
-			}
-                    } catch (error) {
-                console.warn("Error while performing XMLHttpRequest.setRequestHeader()", error);
-                    }
-                    i += 2;
-                }
-
-                try {
-                    xhr.send(null);
-                } catch {
-                    return 0;
-                }
-                var uInt8Array = xhr.response;
-                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
-                var status = xhr.status;
-                if (status === 0) return 0;
-                var hdrs = xhr.getAllResponseHeaders() || "";
-                var hdrsBytes = new TextEncoder().encode(hdrs);
-                var hdrsLen = hdrsBytes.length;
-                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
-                var buf = _malloc(total);
-                if (buf === 0) return 0;
-                var off = buf;
-                Module.HEAPU8[off] = status & 0xFF;
-                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
-                off += 2;
-                Module.HEAPU8[off] = hdrsLen & 0xFF;
-                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
-                off += 4;
-                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
-                off += hdrsLen;
-                Module.HEAPU8[off] = bodyLen & 0xFF;
-                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
-                off += 4;
-                if (bodyLen > 0) {
-                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
-                }
-                return buf;
-            },
-            path.c_str(), n, z, "HEAD");
-
-        i = 0;
-
-        for (auto h : headers) {
-            free(z[i]);
-            i++;
-            free(z[i]);
-            i++;
-        }
-        free(z);
-
-        res = ParseWasmResponse(exe);
-        return res;
+        auto path = NormalizeUrl(info.url, host_port);
+        WasmHeaderArray h(info.headers, info.params);
+        return ParseWasmResponse(wasm_xhr_no_body(path.c_str(), h.count, h.ptrs, "HEAD"));
     }
+
     unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
-        unique_ptr<HTTPResponse> res;
-
-        string path = info.url;
-        if (path[0] == '/') path = host_port + info.url;
-
-        if (!web::experimental_s3_tables_global_proxy.empty()) {
-            if (info.url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
-                auto id_table = path.find("--table-s3.s3.");
-                auto id_aws = path.find(".amazonaws.com/");
-                if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
-                    path = web::experimental_s3_tables_global_proxy + path.substr(8);
-                }
-            }
-        }
-        if ((path.rfind("https://", 0) != 0) && (path.rfind("http://", 0) != 0)) {
-            path = "https://" + path;
-        }
-        auto headers = TransformHeadersWasm(info.headers, info.params);
-        int n = 0;
-        for (auto h : headers) {
-            n++;
-        }
-
-        char **z = (char **)(void *)malloc(n * 4 * 2);
-
-        int i = 0;
-        for (auto h : headers) {
-            z[i] = (char *)malloc(h.first.size() * 4 + 1);
-            memset(z[i], 0, h.first.size() * 4 + 1);
-            memcpy(z[i], h.first.c_str(), h.first.size());
-            i++;
-            z[i] = (char *)malloc(h.second.size() * 4 + 1);
-            memset(z[i], 0, h.second.size() * 4 + 1);
-            memcpy(z[i], h.second.c_str(), h.second.size());
-            i++;
-        }
-
-        const int buffer_length = info.buffer_in_len;
-        char *payload = (char *)malloc(buffer_length);
-        memcpy(payload, info.buffer_in, buffer_length);
-
-        // clang-format off
-        char *exe = NULL;
-        exe = (char *)EM_ASM_PTR(
-            {
-                var url = (UTF8ToString($0));
-                if (typeof XMLHttpRequest === "undefined") {
-                    return 0;
-                }
-                const xhr = new XMLHttpRequest();
-		if (false && url.startsWith("http://")) {
-			url = "https://" + url.substr(7);
-		}
-                xhr.open(UTF8ToString($3), url, false);
-                xhr.responseType = "arraybuffer";
-
-                var i = 0;
-                var len = $1;
-                while (i < len*2) {
-                    var ptr1 = HEAP32[($2)/4 + i ];
-                    var ptr2 = HEAP32[($2)/4 + i + 1];
-
-                    try {
-			var z = encodeURI(UTF8ToString(ptr1));
-			if (z === "Host") z = "X-Host-Override";
-			if (z === "User-Agent") z = "X-user-agent";
-			if (z === "Authorization") {
-                        	xhr.setRequestHeader(z, UTF8ToString(ptr2));
-			} else {
-				
-                        	xhr.setRequestHeader(z, encodeURI(UTF8ToString(ptr2)));
-			}
-                    } catch (error) {
-                console.warn("Error while performing XMLHttpRequest.setRequestHeader()", error);
-                    }
-                    i += 2;
-                }
-
-//xhr.setRequestHeader("Content-Type", "application/octet-stream");
-//xhr.setRequestHeader("Content-Type", "text/json");
-                try {
-			var post_payload = new Uint8Array($5);
-
-			for (var iii = 0; iii < $5; iii++) {
-				post_payload[iii] = Module.HEAPU8[iii + $4];
-			}
-			xhr.send(post_payload);
-                } catch {
-                    return 0;
-                }
-                var uInt8Array = xhr.response;
-                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
-                var status = xhr.status;
-                if (status === 0) return 0;
-                var hdrs = xhr.getAllResponseHeaders() || "";
-                var hdrsBytes = new TextEncoder().encode(hdrs);
-                var hdrsLen = hdrsBytes.length;
-                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
-                var buf = _malloc(total);
-                if (buf === 0) return 0;
-                var off = buf;
-                Module.HEAPU8[off] = status & 0xFF;
-                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
-                off += 2;
-                Module.HEAPU8[off] = hdrsLen & 0xFF;
-                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
-                off += 4;
-                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
-                off += hdrsLen;
-                Module.HEAPU8[off] = bodyLen & 0xFF;
-                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
-                off += 4;
-                if (bodyLen > 0) {
-                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
-                }
-                return buf;
-            },
-            path.c_str(), n, z, "POST", payload, buffer_length);
-        // clang-format on
-
-        free(payload);
-
-        i = 0;
-        for (auto h : headers) {
-            free(z[i]);
-            i++;
-            free(z[i]);
-            i++;
-        }
-        free(z);
-
-        res = ParseWasmResponse(exe);
+        auto path = NormalizeUrl(info.url, host_port);
+        WasmHeaderArray h(info.headers, info.params);
+        auto exe = wasm_xhr_with_body(path.c_str(), h.count, h.ptrs, "POST",
+                                      reinterpret_cast<const char *>(info.buffer_in), info.buffer_in_len);
+        auto res = ParseWasmResponse(exe);
         if (!res->body.empty()) {
             info.buffer_out += res->body;
         }
         return res;
     }
+
     unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
-        unique_ptr<HTTPResponse> res;
-
-        string path = info.url;
-        if (path[0] == '/') path = host_port + info.url;
-
-        if (!web::experimental_s3_tables_global_proxy.empty()) {
-            if (info.url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
-                auto id_table = path.find("--table-s3.s3.");
-                auto id_aws = path.find(".amazonaws.com/");
-                if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
-                    path = web::experimental_s3_tables_global_proxy + path.substr(8);
-                }
-            }
-        }
-        if ((path.rfind("https://", 0) != 0) && (path.rfind("http://", 0) != 0)) {
-            path = "https://" + path;
-        }
-
-        auto headers = TransformHeadersWasm(info.headers, info.params);
-        int n = 0;
-        for (auto h : headers) {
-            n++;
-        }
-
-        char **z = (char **)(void *)malloc(n * 4 * 2);
-
-        int i = 0;
-        for (auto h : headers) {
-            z[i] = (char *)malloc(h.first.size() * 4 + 1);
-            memset(z[i], 0, h.first.size() * 4 + 1);
-            memcpy(z[i], h.first.c_str(), h.first.size());
-            i++;
-            z[i] = (char *)malloc(h.second.size() * 4 + 1);
-            memset(z[i], 0, h.second.size() * 4 + 1);
-            memcpy(z[i], h.second.c_str(), h.second.size());
-            i++;
-        }
-
-        const int buffer_length = info.buffer_in_len;
-        char *payload = (char *)malloc(buffer_length);
-        memcpy(payload, info.buffer_in, buffer_length);
-
-        // clang-format off
-        char *exe = NULL;
-        exe = (char *)EM_ASM_PTR(
-            {
-                var url = (UTF8ToString($0));
-                if (typeof XMLHttpRequest === "undefined") {
-                    return 0;
-                }
-                const xhr = new XMLHttpRequest();
-		if (false && url.startsWith("http://")) {
-			url = "https://" + url.substr(7);
-		}
-                xhr.open(UTF8ToString($3), url, false);
-                xhr.responseType = "arraybuffer";
-
-                var i = 0;
-                var len = $1;
-                while (i < len*2) {
-                    var ptr1 = HEAP32[($2)/4 + i ];
-                    var ptr2 = HEAP32[($2)/4 + i + 1];
-
-                    try {
-			var z = encodeURI(UTF8ToString(ptr1));
-			if (z === "Host") z = "X-Host-Override";
-			if (z === "User-Agent") z = "X-user-agent";
-			if (z === "Authorization") {
-                        	xhr.setRequestHeader(z, UTF8ToString(ptr2));
-			} else {
-				
-                        	xhr.setRequestHeader(z, encodeURI(UTF8ToString(ptr2)));
-			}
-                    } catch (error) {
-                console.warn("Error while performing XMLHttpRequest.setRequestHeader()", error);
-                    }
-                    i += 2;
-                }
-
-//xhr.setRequestHeader("Content-Type", "application/octet-stream");
-//xhr.setRequestHeader("Content-Type", "text/json");
-                try {
-			var post_payload = new Uint8Array($5);
-
-			for (var iii = 0; iii < $5; iii++) {
-				post_payload[iii] = Module.HEAPU8[iii + $4];
-			}
-			xhr.send(post_payload);
-                } catch {
-                    return 0;
-                }
-                var uInt8Array = xhr.response;
-                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
-                var status = xhr.status;
-                if (status === 0) return 0;
-                var hdrs = xhr.getAllResponseHeaders() || "";
-                var hdrsBytes = new TextEncoder().encode(hdrs);
-                var hdrsLen = hdrsBytes.length;
-                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
-                var buf = _malloc(total);
-                if (buf === 0) return 0;
-                var off = buf;
-                Module.HEAPU8[off] = status & 0xFF;
-                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
-                off += 2;
-                Module.HEAPU8[off] = hdrsLen & 0xFF;
-                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
-                off += 4;
-                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
-                off += hdrsLen;
-                Module.HEAPU8[off] = bodyLen & 0xFF;
-                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
-                off += 4;
-                if (bodyLen > 0) {
-                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
-                }
-                return buf;
-            },
-            path.c_str(), n, z, "PUT", payload, buffer_length);
-        // clang-format on
-
-        free(payload);
-
-        i = 0;
-        for (auto h : headers) {
-            free(z[i]);
-            i++;
-            free(z[i]);
-            i++;
-        }
-        free(z);
-
-        res = ParseWasmResponse(exe);
-        return res;
+        auto path = NormalizeUrl(info.url, host_port);
+        WasmHeaderArray h(info.headers, info.params);
+        return ParseWasmResponse(wasm_xhr_with_body(path.c_str(), h.count, h.ptrs, "PUT",
+                                                    reinterpret_cast<const char *>(info.buffer_in), info.buffer_in_len));
     }
+
     unique_ptr<HTTPResponse> Delete(DeleteRequestInfo &info) override {
-        unique_ptr<HTTPResponse> res;
-
-        string path = info.url;
-        if (path[0] == '/') path = host_port + info.url;
-
-        if (!web::experimental_s3_tables_global_proxy.empty()) {
-            if (info.url.rfind(web::experimental_s3_tables_global_proxy, 0) != 0) {
-                auto id_table = path.find("--table-s3.s3.");
-                auto id_aws = path.find(".amazonaws.com/");
-                if (id_table != std::string::npos && id_aws != std::string::npos && id_table < id_aws) {
-                    path = web::experimental_s3_tables_global_proxy + path.substr(8);
-                }
-            }
-        }
-        if ((path.rfind("https://", 0) != 0) && (path.rfind("http://", 0) != 0)) {
-            path = "https://" + path;
-        }
-
-        auto headers = TransformHeadersWasm(info.headers, info.params);
-        int n = 0;
-        for (auto h : headers) {
-            n++;
-        }
-
-        char **z = (char **)(void *)malloc(n * 4 * 2);
-
-        int i = 0;
-        for (auto h : headers) {
-            z[i] = (char *)malloc(h.first.size() * 4 + 1);
-            memset(z[i], 0, h.first.size() * 4 + 1);
-            memcpy(z[i], h.first.c_str(), h.first.size());
-            i++;
-            z[i] = (char *)malloc(h.second.size() * 4 + 1);
-            memset(z[i], 0, h.second.size() * 4 + 1);
-            memcpy(z[i], h.second.c_str(), h.second.size());
-            i++;
-        }
-
-        // clang-format off
-        char *exe = NULL;
-        exe = (char *)EM_ASM_PTR(
-            {
-                var url = (UTF8ToString($0));
-                if (typeof XMLHttpRequest === "undefined") {
-                    return 0;
-                }
-                const xhr = new XMLHttpRequest();
-		if (false && url.startsWith("http://")) {
-			url = "https://" + url.substr(7);
-		}
-                xhr.open(UTF8ToString($3), url, false);
-                xhr.responseType = "arraybuffer";
-
-                var i = 0;
-                var len = $1;
-                while (i < len*2) {
-                    var ptr1 = HEAP32[($2)/4 + i ];
-                    var ptr2 = HEAP32[($2)/4 + i + 1];
-
-                    try {
-			var z = encodeURI(UTF8ToString(ptr1));
-			if (z === "Host") z = "X-Host-Override";
-			if (z === "User-Agent") z = "X-user-agent";
-			if (z === "Authorization") {
-                        	xhr.setRequestHeader(z, UTF8ToString(ptr2));
-			} else {
-				
-                        	xhr.setRequestHeader(z, encodeURI(UTF8ToString(ptr2)));
-			}
-                    } catch (error) {
-                console.warn("Error while performing XMLHttpRequest.setRequestHeader()", error);
-                    }
-                    i += 2;
-                }
-
-                try {
-                    xhr.send(null);
-                } catch {
-                    return 0;
-                }
-                var uInt8Array = xhr.response;
-                var bodyLen = uInt8Array ? uInt8Array.byteLength : 0;
-                var status = xhr.status;
-                if (status === 0) return 0;
-                var hdrs = xhr.getAllResponseHeaders() || "";
-                var hdrsBytes = new TextEncoder().encode(hdrs);
-                var hdrsLen = hdrsBytes.length;
-                var total = 2 + 4 + hdrsLen + 4 + bodyLen;
-                var buf = _malloc(total);
-                if (buf === 0) return 0;
-                var off = buf;
-                Module.HEAPU8[off] = status & 0xFF;
-                Module.HEAPU8[off + 1] = (status >> 8) & 0xFF;
-                off += 2;
-                Module.HEAPU8[off] = hdrsLen & 0xFF;
-                Module.HEAPU8[off + 1] = (hdrsLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (hdrsLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (hdrsLen >> 24) & 0xFF;
-                off += 4;
-                if (hdrsLen > 0) Module.HEAPU8.set(hdrsBytes, off);
-                off += hdrsLen;
-                Module.HEAPU8[off] = bodyLen & 0xFF;
-                Module.HEAPU8[off + 1] = (bodyLen >> 8) & 0xFF;
-                Module.HEAPU8[off + 2] = (bodyLen >> 16) & 0xFF;
-                Module.HEAPU8[off + 3] = (bodyLen >> 24) & 0xFF;
-                off += 4;
-                if (bodyLen > 0) {
-                    Module.HEAPU8.set(new Uint8Array(uInt8Array), off);
-                }
-                return buf;
-            },
-            path.c_str(), n, z, "DELETE");
-        // clang-format on
-
-        i = 0;
-        for (auto h : headers) {
-            free(z[i]);
-            i++;
-            free(z[i]);
-            i++;
-        }
-        free(z);
-
-        res = ParseWasmResponse(exe);
-        return res;
+        auto path = NormalizeUrl(info.url, host_port);
+        WasmHeaderArray h(info.headers, info.params);
+        return ParseWasmResponse(wasm_xhr_no_body(path.c_str(), h.count, h.ptrs, "DELETE"));
     }
 
    private:
@@ -743,11 +278,11 @@ console.log('HEAD', UTF8ToString(ptr1), UTF8ToString(ptr2));
 };
 
 unique_ptr<HTTPClient> HTTPWasmUtil::InitializeClient(HTTPParams &http_params, const string &proto_host_port) {
-    auto client = make_uniq<HTTPWasmClient>(http_params.Cast<HTTPFSParams>(), proto_host_port);
-    return std::move(client);
+    return make_uniq<HTTPWasmClient>(http_params.Cast<HTTPFSParams>(), proto_host_port);
 }
 
-string HTTPWasmUtil::GetName() const { return "WasmHTTPUtils"; }
+string HTTPWasmUtil::GetName() const {
+    return "WasmHTTPUtils";
+}
 
 }  // namespace duckdb
-
