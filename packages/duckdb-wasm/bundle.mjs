@@ -36,7 +36,7 @@ import { execSync } from 'child_process';
 // The lack of alternatives for Karma won't allow us to bundle workers and tests as ESM.
 // We should upgrade all CommonJS bundles to ESM as soon as the dynamic requires are resolved.
 
-const TARGET_BROWSER = ['chrome64', 'edge79', 'firefox62', 'safari11.1'];
+const TARGET_BROWSER = ['chrome67', 'edge79', 'firefox68', 'safari14'];
 const TARGET_BROWSER_TEST = ['es2020'];
 const TARGET_NODE = ['node14.6'];
 const EXTERNALS_NODE = ['apache-arrow'];
@@ -101,9 +101,12 @@ fs.copyFile(path.resolve(src, 'bindings', 'duckdb-coi.wasm'), path.resolve(dist,
 (async () => {
     // Don't attempt to bundle NodeJS modules in the browser build.
     console.log('[ ESBUILD ] Patch bindings');
-    patchFile('./src/bindings/duckdb-mvp.js', 'child_process');
-    patchFile('./src/bindings/duckdb-eh.js', 'child_process');
-    patchFile('./src/bindings/duckdb-coi.js', 'child_process');
+    const nodeModules = ['child_process', 'node:fs', 'node:crypto', 'node:os', 'node:util', 'node:worker_threads'];
+    for (const variant of ['duckdb-mvp', 'duckdb-eh', 'duckdb-coi']) {
+        for (const mod of nodeModules) {
+            patchFile(`./src/bindings/${variant}.js`, mod);
+        }
+    }
     patchFile('./src/bindings/duckdb-coi.pthread.js', 'vm');
 
     // -------------------------------
@@ -217,19 +220,23 @@ fs.copyFile(path.resolve(src, 'bindings', 'duckdb-coi.wasm'), path.resolve(dist,
         define: { 'process.release.name': '"browser"' },
     });
 
-    console.log('[ ESBUILD ] duckdb-browser-coi.pthread.worker.js');
-    await esbuild.build({
-        entryPoints: ['./src/targets/duckdb-browser-coi.pthread.worker.ts'],
-        outfile: 'dist/duckdb-browser-coi.pthread.worker.js',
-        platform: 'browser',
-        format: 'iife',
-        target: TARGET_BROWSER,
-        bundle: true,
-        minify: !is_debug,
-        sourcemap: is_debug ? 'inline' : true,
-        external: EXTERNALS_WEBWORKER,
-        define: { 'process.release.name': '"browser"' },
-    });
+    if (fs.existsSync('./src/bindings/duckdb-coi.pthread.js')) {
+        console.log('[ ESBUILD ] duckdb-browser-coi.pthread.worker.js');
+        await esbuild.build({
+            entryPoints: ['./src/targets/duckdb-browser-coi.pthread.worker.ts'],
+            outfile: 'dist/duckdb-browser-coi.pthread.worker.js',
+            platform: 'browser',
+            format: 'iife',
+            target: TARGET_BROWSER,
+            bundle: true,
+            minify: !is_debug,
+            sourcemap: is_debug ? 'inline' : true,
+            external: EXTERNALS_WEBWORKER,
+            define: { 'process.release.name': '"browser"' },
+        });
+    } else {
+        console.log('[ SKIP ] duckdb-browser-coi.pthread.worker.js (no pthread worker with emsdk 5.x)');
+    }
 
     // -------------------------------
     // Node bundles
@@ -365,6 +372,7 @@ function patchFile(fileName, moduleName) {
     // - the sed expression is executed within single quotes
     // - we have to terminate the quotes
     // - we have to escape the middle quote
+    if (!fs.existsSync(fileName)) return;
     const sedCommand = `s/require(["'\\'']${moduleName}["'\\''])/["${moduleName}"].map(require)/g`;
     execSync(`sed -i.bak '${sedCommand}' ${fileName} && rm ${fileName}.bak`);
 }
