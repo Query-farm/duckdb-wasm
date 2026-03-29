@@ -4,24 +4,42 @@
 
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/web/config.h"
+// DuckDB's MbedTLS wrapper — use the full include path since it's in third_party
+#include "../../submodules/duckdb/third_party/mbedtls/include/mbedtls_wrapper.hpp"
 
-// js-stubs that need to be available to WASM side modules (extensions).
+// Platform stubs available to WASM side modules (extensions).
+
+// SHA-256 using DuckDB's bundled MbedTLS — implemented in C++ (not JS) so it's
+// a real WASM function available to side modules via dynamic linking.
+extern "C" void duckdb_wasm_sha256(const void *data, int len, void *out_hash) {
+    duckdb_mbedtls::MbedTlsWrapper::SHA256State state;
+    state.AddString(std::string(static_cast<const char *>(data), len));
+    char hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
+    state.FinishHex(hex);
+    // Convert hex to raw bytes
+    auto *out = static_cast<unsigned char *>(out_hash);
+    for (int i = 0; i < 32; i++) {
+        auto hi = hex[i * 2], lo = hex[i * 2 + 1];
+        out[i] = static_cast<unsigned char>(
+            ((hi >= 'a' ? hi - 'a' + 10 : hi - '0') << 4) |
+             (lo >= 'a' ? lo - 'a' + 10 : lo - '0'));
+    }
+}
+
+// js-stubs that need to be available to WASM side modules.
 // The main module must reference them so the linker includes them in wasmImports.
 extern "C" {
 void duckdb_wasm_crypto_random(void *buf, int len);
-void duckdb_wasm_sha256(const void *data, int len, void *out_hash);
-char *duckdb_wasm_open_auth_url(const char *url);
+char *duckdb_wasm_open_auth_url(const char *url, int timeout_ms);
 char *duckdb_wasm_get_auth_error(int unused);
+char *duckdb_wasm_get_page_origin(void);
 }
 
 __attribute__((constructor)) static void _register_wasm_stubs() {
-    // Force these js-stubs into wasmImports by calling them once at startup.
-    // duckdb_wasm_crypto_random with len=0 is a no-op.
     duckdb_wasm_crypto_random(nullptr, 0);
-    // The others just need their address taken to prevent tree-shaking.
-    volatile auto p1 = &duckdb_wasm_sha256;
-    volatile auto p2 = &duckdb_wasm_open_auth_url;
-    volatile auto p3 = &duckdb_wasm_get_auth_error;
+    volatile auto p1 = &duckdb_wasm_open_auth_url;
+    volatile auto p2 = &duckdb_wasm_get_auth_error;
+    volatile auto p3 = &duckdb_wasm_get_page_origin;
     (void)p1; (void)p2; (void)p3;
 }
 
